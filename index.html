@@ -487,6 +487,7 @@ dialog.sheet.fb{position:fixed; inset:0; margin:auto; z-index:70; max-height:88v
 .hidnote{font-size:12.5px; color:var(--mute); margin:4px 0 12px}
 .hidnote button{background:none; border:0; color:var(--navy); font-weight:600; cursor:pointer; padding:0; font-size:12.5px}
 
+.exportrow{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:-4px 0 14px}
 /* ---------- verdict ---------- */
 .verdict{border-radius:var(--r); padding:18px 20px; border:1px solid var(--line); margin-top:16px}
 .verdict.buy{background:var(--good-soft); border-color:var(--good)}
@@ -544,7 +545,7 @@ dialog.sheet.fb{position:fixed; inset:0; margin:auto; z-index:70; max-height:88v
     
     <span class="chip">Bright Winter · unconfirmed</span>
     <span class="chip" id="countchip">79 pieces</span>
-    <span class="chip" id="buildchip" title="App version">BUILD 13</span>
+    <span class="chip" id="buildchip" title="App version">BUILD 14</span>
   </div>
 </header>
 
@@ -675,6 +676,8 @@ dialog.sheet.fb{position:fixed; inset:0; margin:auto; z-index:70; max-height:88v
       <option value="worst">Lowest rated first — candidates to let go</option>
     </select>
   </div>
+  <div class="exportrow"><button type="button" class="btn ghost sm" id="c-export">⤓ Export my closet</button>
+    <span class="hint" id="c-export-status" style="margin:0">All photos, ratings and outfits in one ZIP.</span></div>
   <p class="hint tapnote">Tap any piece to review it, re-rate it, style it or remove it.</p>
   <div class="grid" id="c-grid"></div>
 
@@ -1993,6 +1996,91 @@ function mergeLocal(remote, local, key) {
   }, onErr);
 })();
 function paintSheetIfOpen() { if (rvKey) paintSheet(); }
+
+
+/* ---------------- export everything as one ZIP ---------------- */
+/* tiny store-only zip writer: photos are already JPEG, so compression would gain nothing */
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u8) { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = CRC_T[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function makeZip(files) {
+  const enc = new TextEncoder(), parts = [], central = []; let offset = 0;
+  const d = new Date(), dt = ((d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1)) & 0xFFFF,
+        dd = (((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xFFFF;
+  for (const f of files) {
+    const name = enc.encode(f.name), data = f.data, crc = crc32(data);
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 0, true);
+    h.setUint16(10, dt, true); h.setUint16(12, dd, true); h.setUint32(14, crc, true);
+    h.setUint32(18, data.length, true); h.setUint32(22, data.length, true); h.setUint16(26, name.length, true); h.setUint16(28, 0, true);
+    parts.push(new Uint8Array(h.buffer), name, data);
+    const c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true); c.setUint16(10, 0, true);
+    c.setUint16(12, dt, true); c.setUint16(14, dd, true); c.setUint32(16, crc, true); c.setUint32(20, data.length, true); c.setUint32(24, data.length, true);
+    c.setUint16(28, name.length, true); c.setUint32(42, offset, true);
+    central.push(new Uint8Array(c.buffer), name);
+    offset += 30 + name.length + data.length;
+  }
+  const csize = central.reduce((s, p) => s + p.length, 0);
+  const e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true);
+  e.setUint32(12, csize, true); e.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, new Uint8Array(e.buffer)], { type: "application/zip" });
+}
+const slug = s => String(s || "piece").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "piece";
+const csvCell = v => { const s = String(v == null ? "" : v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+const csv = rows => "﻿" + rows.map(r => r.map(csvCell).join(",")).join("\r\n");
+async function imgBytes(src) {
+  if (!src) return null;
+  if (src.startsWith("data:")) { const b = atob(src.split(",")[1] || ""); const u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; }
+  try { const r = await fetch(src); if (!r.ok) return null; return new Uint8Array(await r.arrayBuffer()); } catch (e) { return null; }
+}
+async function buildExport(progress) {
+  const enc = new TextEncoder(), files = [], used = new Set();
+  const uniq = (dir, base, ext) => { let n = dir + base + ext, i = 2; while (used.has(n)) n = dir + base + "-" + i++ + ext; used.add(n); return n; };
+  const items = allItems(), rows = [["Key","Name","Category","Colour","Palette","In closet","Body rating","Body reason","Tone rating","Tone reason","Notes","My note","Photo file"]];
+  let done = 0;
+  for (const it of items) {
+    const r = rating(it), bytes = await imgBytes(imgSrc(it));
+    const file = bytes ? uniq("photos/", slug(it.name), ".jpg") : "";
+    if (bytes) files.push({ name: file, data: bytes });
+    rows.push([it.k, it.name, it.cat, it.color, PAL_LABEL[safePal(it.pal)], isRemoved(it) ? "Removed" : "Yes",
+      r.body || "", it.br || "", r.tone || "", it.tr || "", it.note || "", r.note || "", file]);
+    if (++done % 10 === 0) progress("Photos " + done + " of " + items.length);
+  }
+  files.push({ name: "closet.csv", data: enc.encode(csv(rows)) });
+  const oRows = [["Outfit","Type","Pieces","Piece keys","How to wear it","Hidden (a piece was removed)"]];
+  allOutfits().forEach(o => oRows.push([o.name, KIND_LABEL[safeKind(o.kind)], (o.keys || []).map(k => (findItem(k) || {}).name || k).join(" + "),
+    (o.keys || []).join(" "), o.why || "", outfitLive(o) ? "" : "Yes"]));
+  files.push({ name: "outfits.csv", data: enc.encode(csv(oRows)) });
+  progress("Pictures and ideas");
+  for (const [id, p] of Object.entries(state.pics || {})) { const b = await imgBytes(imgSrc(p)); if (b) files.push({ name: uniq("ai-pictures/", slug(id), ".jpg"), data: b }); }
+  for (const i of state.inspo || []) { const b = await imgBytes(imgSrc(i)); if (b) files.push({ name: uniq("ideas/", slug(i.title || i.id), ".jpg"), data: b }); }
+  files.push({ name: "closet.json", data: enc.encode(JSON.stringify({ exported: new Date().toISOString(),
+    items: items.map(it => ({ key: it.k, name: it.name, category: it.cat, colour: it.color, palette: safePal(it.pal), removed: isRemoved(it), rating: rating(it) })),
+    outfits: allOutfits().map(o => ({ name: o.name, kind: safeKind(o.kind), keys: o.keys, why: o.why || "" })) }, null, 2)) });
+  files.push({ name: "README.txt", data: enc.encode("Closet Studio export\n\nphotos/     one JPEG per piece (the name matches closet.csv)\ncloset.csv  every piece with its ratings; opens in Excel, Numbers or Google Sheets\noutfits.csv every saved outfit\nai-pictures/ and ideas/  pictures you added\ncloset.json the same data for importing into another app\n") });
+  return { blob: makeZip(files), count: items.length };
+}
+let DOWNLOADS = null;
+$("c-export").onclick = async () => {
+  const btn = $("c-export"), st = $("c-export-status");
+  btn.disabled = true; st.textContent = "Preparing…";
+  try {
+    const { blob, count } = await buildExport(m => { st.textContent = m + "…"; });
+    const name = "closet-studio-" + new Date().toISOString().slice(0, 10) + ".zip";
+    if (IN_CLAUDE) {
+      if (!DOWNLOADS) DOWNLOADS = await window.claude.use("downloads").catch(() => null);
+      if (!DOWNLOADS) { st.textContent = "Downloads aren't available in this view. Try the Claude desktop or web app."; return; }
+      await DOWNLOADS.save({ filename: name, data: blob });
+    } else {
+      const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+    }
+    st.textContent = count + " pieces exported.";
+  } catch (e) {
+    st.textContent = e && e.code === "declined" ? "Cancelled." : e && e.code === "rate_limited" ? "A save is already open. Finish that one first." : "Export failed. Try again.";
+  } finally { btn.disabled = false; setTimeout(() => { st.textContent = ""; }, 8000); }
+};
 
 </script>
 
